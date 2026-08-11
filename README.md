@@ -1,33 +1,24 @@
 # FYERS Trading App
 
-A web-based trading dashboard built with Streamlit and designed to connect with the FYERS API.
+A Streamlit trading dashboard connected to the FYERS API.
 
-## Planned Features
+## Current stage
 
-- FYERS API integration
+- Streamlit app
+- Secure Streamlit Secrets for FYERS credentials
+- FYERS API v3 authentication
+- FYERS connection verification
+
+## Planned features
+
 - Live market data
 - Price charts
 - Open Interest analysis
-- Long Buildup + Short Covering
-- Short Buildup + Long Unwinding
+- Bullish: Long Buildup + Short Covering
+- Bearish: Short Buildup + Long Unwinding
+- TradingView-style chart interface
 - Technical indicators
-- Watchlist
-- Trading dashboard
 
-## Signal Classification
+## Security
 
-### Bullish
-
-- Long Buildup
-- Short Covering
-
-### Bearish
-
-- Short Buildup
-- Long Unwinding
-
-## Technology
-
-- Python
-- Streamlit
-- FYERS API
+FYERS credentials must be stored in Streamlit Secrets and must not be committed to GitHub.
