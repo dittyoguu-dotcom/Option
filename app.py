@@ -198,7 +198,8 @@ def vol_oi_tag(b):
 # Demo mode — same seeded mock generator as the original preview, so the
 # dashboard is still meaningful outside market hours.
 # ---------------------------------------------------------------------------
-def demo_ticks(strike, opt_type, n=60):
+def demo_ticks(strike, opt_type, n=150):
+    import math
     import random
     rand = random.Random(f"{strike}-{opt_type}")
     dist = abs(strike - 24525)
@@ -208,13 +209,15 @@ def demo_ticks(strike, opt_type, n=60):
     oi = 400000 + rand.randint(0, 500000)
     ticks = []
     for i in range(n):
-        drift = (rand.random() - 0.5) * 3
+        # sine wander + noise, same shape as the original JS mock, so a full
+        # session spans a realistic premium range instead of a flat ₹10-20 band
+        drift = math.sin(i / 9 + rand.random() * 3) * 1.6 + (rand.random() - 0.5) * 2.4
         prev = premium
         premium = max(2, premium + drift)
         oi_delta = round((rand.random() - 0.42) * 9000)
         oi = max(1000, oi + oi_delta)
         volume = int(400 + abs(premium - prev) * 900 + rand.random() * 1800)
-        ticks.append({"time": (datetime.now() - timedelta(minutes=(n - i))).strftime("%H:%M"),
+        ticks.append({"time": (datetime.now() - timedelta(minutes=(n - i) * 2)).strftime("%H:%M"),
                        "premium": round(premium, 1), "prev_premium": round(prev, 1),
                        "oi_delta": oi_delta, "oi": oi, "volume": volume})
     return ticks
@@ -275,6 +278,7 @@ opt_type = c2.radio("Type", ["CE", "PE"], horizontal=True)
 # Tick history — accumulate real polls in session_state
 # ---------------------------------------------------------------------------
 key = f"ticks_{strike}_{opt_type}_{expiry_ts}"
+baseline_key = f"baseline_{strike}_{opt_type}_{expiry_ts}"
 if key not in st.session_state:
     st.session_state[key] = []
 
@@ -282,20 +286,32 @@ if mode == "Live (Fyers)":
     match = next((r for r in rows if r["strike_price"] == strike and r["option_type"] == opt_type), None)
     if match:
         hist = st.session_state[key]
-        prev = hist[-1] if hist else None
-        prev_premium = prev["premium"] if prev else match["ltp"]
-        prev_oi = prev["oi"] if prev else match["oi"]
-        new_tick = {
-            "time": datetime.now().strftime("%H:%M:%S"),
-            "premium": match["ltp"],
-            "prev_premium": prev_premium,
-            "oi": match["oi"],
-            "oi_delta": match["oi"] - prev_oi,
-            "volume": match.get("volume", 0),
-        }
-        # Only append if it's actually a new poll (avoid dup on same rerun)
-        if not hist or hist[-1]["time"] != new_tick["time"]:
-            hist.append(new_tick)
+        baseline = st.session_state.get(baseline_key)
+
+        if baseline is None:
+            # First poll for this contract — nothing to compare against yet,
+            # so just record a baseline instead of a fake zero-change tick.
+            st.session_state[baseline_key] = {
+                "premium": match["ltp"], "oi": match["oi"], "volume": match.get("volume", 0),
+            }
+        else:
+            new_tick = {
+                "time": datetime.now().strftime("%H:%M:%S"),
+                "premium": match["ltp"],
+                "prev_premium": baseline["premium"],
+                "oi": match["oi"],
+                "oi_delta": match["oi"] - baseline["oi"],
+                # Fyers reports cumulative day volume, not per-poll volume —
+                # take the difference so buckets reflect actual trading in
+                # that interval, not the whole day's total re-added each poll.
+                "volume": max(0, match.get("volume", 0) - baseline["volume"]),
+            }
+            # Only append if it's actually a new poll (avoid dup on same rerun)
+            if not hist or hist[-1]["time"] != new_tick["time"]:
+                hist.append(new_tick)
+            st.session_state[baseline_key] = {
+                "premium": match["ltp"], "oi": match["oi"], "volume": match.get("volume", 0),
+            }
     ticks = st.session_state[key]
     # also pull CE/PE OI totals for PCR from this same poll (no extra call)
     ce_oi = sum(r["oi"] for r in rows if r["option_type"] == "CE")
@@ -306,7 +322,14 @@ else:
     pe_oi = sum(t["oi"] for t in demo_ticks(strike, "PE"))
 
 if not ticks:
-    st.info("Waiting for the first tick... this fills in as the market moves.")
+    if mode == "Live (Fyers)":
+        st.info(
+            f"Collecting the first data point for NIFTY {strike} {opt_type}... "
+            f"the chart needs at least two polls (~{refresh_secs}s apart) before "
+            "it can show a change. It'll appear automatically."
+        )
+    else:
+        st.info("Waiting for the first tick... this fills in as the market moves.")
     st.stop()
 
 current_premium = ticks[-1]["premium"]
