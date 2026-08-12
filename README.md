@@ -1,21 +1,29 @@
-# FYERS NIFTY Price + OI Signals
+# NIFTY OI Confluence Dashboard
 
-This version compares two real NIFTY option-chain snapshots from FYERS.
+This is the live Streamlit version of the uploaded OI Confluence dashboard.
 
-Signals:
-- Price up + OI up = Long Buildup
-- Price up + OI down = Short Covering
-- Price down + OI up = Short Buildup
-- Price down + OI down = Long Unwinding
+It connects directly to the existing FYERS API session and uses the real NIFTY option chain.
 
-Bullish group:
-- Long Buildup
-- Short Covering
+Dashboard features:
+- NIFTY spot
+- Strike selector
+- CE/PE selector
+- PCR
+- Market Control
+- Bullish: Long Buildup + Short Covering
+- Bearish: Short Buildup + Long Unwinding
+- Support / Resistance zones
+- Confluence
+- OI buildup by premium range
+- Alert threshold
+- Live option-chain table
+- Signal breakdown
 
-Bearish group:
-- Short Buildup
-- Long Unwinding
+The uploaded React dashboard's mock data has been removed.
 
-This is an analytical tool, not a trade recommendation.
+Important:
+The original dashboard classified each mock tick using tick-to-tick premium and OI direction. The live FYERS option-chain endpoint provides LTP and OI/OI-change fields, so this first live dashboard classifies using those returned fields.
 
-Keep FYERS credentials in Streamlit Secrets and never commit them to GitHub.
+No order placement is included.
+
+Keep FYERS credentials only in Streamlit Secrets.
