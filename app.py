@@ -1,14 +1,15 @@
 import streamlit as st
 import pandas as pd
+from datetime import datetime
 from fyers_apiv3 import fyersModel
 
-st.set_page_config(page_title="FYERS NIFTY Option Chain", page_icon="ðŸ“ˆ", layout="wide")
+st.set_page_config(page_title="FYERS NIFTY Signals", page_icon="ðŸ“ˆ", layout="wide")
 
 APP_ID = st.secrets["FYERS_APP_ID"]
 SECRET_ID = st.secrets["FYERS_SECRET_ID"]
 REDIRECT_URI = st.secrets["FYERS_REDIRECT_URI"]
 
-def create_fyers_session():
+def fyers_session():
     return fyersModel.SessionModel(
         client_id=APP_ID,
         redirect_uri=REDIRECT_URI,
@@ -19,27 +20,26 @@ def create_fyers_session():
     )
 
 auth_code = st.query_params.get("auth_code")
-
 if auth_code and "access_token" not in st.session_state:
     try:
-        session = create_fyers_session()
-        session.set_token(auth_code)
-        response = session.generate_token()
-        if "access_token" in response:
-            st.session_state["access_token"] = response["access_token"]
+        s = fyers_session()
+        s.set_token(auth_code)
+        result = s.generate_token()
+        if "access_token" in result:
+            st.session_state["access_token"] = result["access_token"]
             st.query_params.clear()
             st.rerun()
         else:
             st.error("FYERS did not return an access token.")
-            st.json(response)
+            st.json(result)
     except Exception as e:
-        st.error("FYERS connection failed.")
+        st.error("FYERS authentication failed.")
         st.exception(e)
 
 if "access_token" not in st.session_state:
-    st.title("ðŸ“ˆ FYERS Trading App")
-    st.info("Connect your FYERS account to continue.")
-    st.link_button("ðŸ” Connect FYERS", create_fyers_session().generate_authcode())
+    st.title("ðŸ“ˆ FYERS NIFTY Signals")
+    st.info("Connect FYERS to continue.")
+    st.link_button("ðŸ” Connect FYERS", fyers_session().generate_authcode())
     st.stop()
 
 fyers = fyersModel.FyersModel(
@@ -49,117 +49,168 @@ fyers = fyersModel.FyersModel(
     log_path=""
 )
 
-st.title("ðŸ“ˆ FYERS NIFTY Option Chain")
+st.title("ðŸ“ˆ NIFTY Price + OI Signals")
 st.success("FYERS Connected âœ…")
 
-strike_count = st.selectbox(
-    "Number of strikes on each side of ATM",
-    [5, 10, 15, 20],
-    index=1
-)
+strike_count = st.selectbox("Strikes on each side of ATM", [5, 10, 15, 20], index=1)
 
-if st.button("ðŸ”„ Load NIFTY Option Chain", type="primary"):
-    st.session_state["load_chain"] = True
+if "previous_snapshot" not in st.session_state:
+    st.session_state["previous_snapshot"] = None
 
-if not st.session_state.get("load_chain"):
-    st.info("Tap Load NIFTY Option Chain to request real NIFTY data from FYERS.")
-    st.stop()
-
-request_data = {
-    "symbol": "NSE:NIFTY50-INDEX",
-    "strikecount": strike_count,
-    "timestamp": ""
-}
-
-try:
-    response = fyers.optionchain(data=request_data)
-except Exception as e:
-    st.error("The FYERS option-chain request failed.")
-    st.exception(e)
-    st.stop()
-
-if response.get("s") != "ok":
-    st.error("FYERS returned an unsuccessful option-chain response.")
-    st.json(response)
-    st.stop()
-
-data = response.get("data", {})
-chain = data.get("optionsChain", [])
-
-if not chain:
-    st.warning("FYERS returned no option-chain rows. Try again during market hours.")
-    st.json(response)
-    st.stop()
-
-underlying = next(
-    (x for x in chain if x.get("symbol") == "NSE:NIFTY50-INDEX"),
-    None
-)
-
-if underlying:
-    c1, c2, c3 = st.columns(3)
-    c1.metric("NIFTY Spot", f"â‚¹{underlying.get('ltp', 0):,.2f}")
-    c2.metric("Change", f"{underlying.get('ch', 0):,.2f}")
-    c3.metric("Change %", f"{underlying.get('chp', 0):,.2f}%")
-
-rows = []
-for item in chain:
-    option_type = str(item.get("option_type", "")).upper()
-    if option_type not in ("CE", "PE"):
-        continue
-    rows.append({
-        "Strike": item.get("strike_price"),
-        "Type": option_type,
-        "LTP": item.get("ltp"),
-        "OI": item.get("oi"),
-        "OI Change": item.get("oich"),
-        "Volume": item.get("volume"),
-        "Bid": item.get("bid"),
-        "Ask": item.get("ask"),
-        "Symbol": item.get("symbol")
+def fetch_chain():
+    response = fyers.optionchain(data={
+        "symbol": "NSE:NIFTY50-INDEX",
+        "strikecount": strike_count,
+        "timestamp": ""
     })
+    if response.get("s") != "ok":
+        raise RuntimeError(str(response))
+    return response
 
-if not rows:
-    st.warning("No CE/PE rows were found in the FYERS response.")
-    st.write("Returned keys:", list(chain[0].keys()) if chain else [])
+def make_frame(response):
+    chain = response.get("data", {}).get("optionsChain", [])
+    rows = []
+    spot = None
+
+    for item in chain:
+        if item.get("symbol") == "NSE:NIFTY50-INDEX":
+            spot = item.get("ltp")
+            continue
+
+        typ = str(item.get("option_type", "")).upper()
+        if typ not in ("CE", "PE"):
+            continue
+
+        rows.append({
+            "Strike": item.get("strike_price"),
+            "Type": typ,
+            "LTP": item.get("ltp"),
+            "OI": item.get("oi"),
+            "Volume": item.get("volume"),
+            "Symbol": item.get("symbol")
+        })
+
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return spot, df
+
+    for col in ["Strike", "LTP", "OI", "Volume"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    return spot, df
+
+def classify(price_change, oi_change):
+    if pd.isna(price_change) or pd.isna(oi_change):
+        return "Unknown"
+    if price_change > 0 and oi_change > 0:
+        return "Long Buildup"
+    if price_change > 0 and oi_change < 0:
+        return "Short Covering"
+    if price_change < 0 and oi_change > 0:
+        return "Short Buildup"
+    if price_change < 0 and oi_change < 0:
+        return "Long Unwinding"
+    return "Neutral"
+
+st.caption(
+    "Take two snapshots at different times. Signals compare price and OI "
+    "between those snapshots; they are analytical labels, not trade recommendations."
+)
+
+if st.button("ðŸ“¸ Capture Snapshot", type="primary"):
+    try:
+        response = fetch_chain()
+        spot, current = make_frame(response)
+
+        st.session_state["previous_snapshot"] = {
+            "time": datetime.now().strftime("%H:%M:%S"),
+            "spot": spot,
+            "chain": current
+        }
+        st.success(f"Snapshot captured at {st.session_state['previous_snapshot']['time']}")
+    except Exception as e:
+        st.error("Could not capture NIFTY option-chain snapshot.")
+        st.exception(e)
+
+previous = st.session_state["previous_snapshot"]
+
+if previous is None:
+    st.info("Capture the first snapshot. Then wait for your chosen interval and capture another snapshot.")
     st.stop()
 
-df = pd.DataFrame(rows)
-df["Strike"] = pd.to_numeric(df["Strike"], errors="coerce")
-df = df.dropna(subset=["Strike"]).sort_values(["Strike", "Type"])
+st.write(f"**Previous snapshot:** {previous['time']}")
 
-ce = df[df["Type"] == "CE"].copy().drop(columns=["Type"])
-pe = df[df["Type"] == "PE"].copy().drop(columns=["Type"])
+if st.button("ðŸ”Ž Capture New Snapshot & Calculate Signals"):
+    try:
+        response = fetch_chain()
+        spot, current = make_frame(response)
 
-ce = ce.rename(columns={
-    "LTP": "CE LTP", "OI": "CE OI", "OI Change": "CE OI Change",
-    "Volume": "CE Volume", "Bid": "CE Bid", "Ask": "CE Ask", "Symbol": "CE Symbol"
-})
-pe = pe.rename(columns={
-    "LTP": "PE LTP", "OI": "PE OI", "OI Change": "PE OI Change",
-    "Volume": "PE Volume", "Bid": "PE Bid", "Ask": "PE Ask", "Symbol": "PE Symbol"
-})
+        old = previous["chain"].copy()
+        new = current.copy()
 
-table = pd.merge(ce, pe, on="Strike", how="outer").sort_values("Strike")
+        old = old.rename(columns={"LTP": "Old LTP", "OI": "Old OI"})
+        merged = new.merge(
+            old[["Symbol", "Old LTP", "Old OI"]],
+            on="Symbol",
+            how="inner"
+        )
 
-st.subheader("Real NIFTY Option Chain")
-st.caption("Data is requested directly from your connected FYERS account.")
+        merged["Price Change"] = merged["LTP"] - merged["Old LTP"]
+        merged["OI Change"] = merged["OI"] - merged["Old OI"]
+        merged["Signal"] = merged.apply(
+            lambda r: classify(r["Price Change"], r["OI Change"]), axis=1
+        )
 
-display_cols = [
-    "CE LTP", "CE OI", "CE OI Change", "CE Volume",
-    "Strike",
-    "PE LTP", "PE OI", "PE OI Change", "PE Volume"
-]
-display_cols = [c for c in display_cols if c in table.columns]
+        bullish = merged["Signal"].isin(["Long Buildup", "Short Covering"]).sum()
+        bearish = merged["Signal"].isin(["Short Buildup", "Long Unwinding"]).sum()
 
-st.dataframe(table[display_cols], use_container_width=True, hide_index=True)
+        c1, c2, c3 = st.columns(3)
+        c1.metric("NIFTY Spot", f"â‚¹{spot:,.2f}" if spot is not None else "â€”")
+        c2.metric("Bullish Contracts", int(bullish))
+        c3.metric("Bearish Contracts", int(bearish))
 
-c1, c2 = st.columns(2)
-with c1:
-    st.metric("Total CE OI", f"{pd.to_numeric(table['CE OI'], errors='coerce').fillna(0).sum():,.0f}")
-with c2:
-    st.metric("Total PE OI", f"{pd.to_numeric(table['PE OI'], errors='coerce').fillna(0).sum():,.0f}")
+        st.subheader("Signal Summary")
+
+        summary = (
+            merged.groupby("Signal")
+            .size()
+            .reindex(
+                ["Long Buildup", "Short Covering", "Short Buildup", "Long Unwinding", "Neutral", "Unknown"],
+                fill_value=0
+            )
+            .rename("Contracts")
+            .reset_index()
+        )
+        st.dataframe(summary, use_container_width=True, hide_index=True)
+
+        st.subheader("Strike-Level Signals")
+        cols = [
+            "Strike", "Type", "LTP", "Old LTP", "Price Change",
+            "OI", "Old OI", "OI Change", "Signal"
+        ]
+        st.dataframe(
+            merged[[c for c in cols if c in merged.columns]]
+            .sort_values(["Strike", "Type"]),
+            use_container_width=True,
+            hide_index=True
+        )
+
+        # Keep the new snapshot for the next comparison.
+        st.session_state["previous_snapshot"] = {
+            "time": datetime.now().strftime("%H:%M:%S"),
+            "spot": spot,
+            "chain": current
+        }
+
+    except Exception as e:
+        st.error("Could not compare the snapshots.")
+        st.exception(e)
 
 st.divider()
-st.subheader("Next stage")
-st.write("After confirming real data, we will calculate Long Buildup, Short Covering, Short Buildup and Long Unwinding.")
+st.subheader("How we group the signals")
+st.write("ðŸŸ¢ Bullish = Long Buildup + Short Covering")
+st.write("ðŸ”´ Bearish = Short Buildup + Long Unwinding")
+st.caption(
+    "This first version uses two captured snapshots. The next version can add "
+    "automatic refresh/storage and feed the results into the full dashboard."
+)
