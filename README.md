@@ -1,24 +1,15 @@
-# FYERS Trading App
+# FYERS NIFTY Option Chain
 
-A Streamlit trading dashboard connected to the FYERS API.
+Current stage:
+- Streamlit connected to FYERS API v3
+- Real NIFTY option-chain request
+- CE/PE strike, LTP, OI, OI change and volume display
 
-## Current stage
+Next:
+- Long Buildup
+- Short Covering
+- Short Buildup
+- Long Unwinding
+- Full market-control dashboard
 
-- Streamlit app
-- Secure Streamlit Secrets for FYERS credentials
-- FYERS API v3 authentication
-- FYERS connection verification
-
-## Planned features
-
-- Live market data
-- Price charts
-- Open Interest analysis
-- Bullish: Long Buildup + Short Covering
-- Bearish: Short Buildup + Long Unwinding
-- TradingView-style chart interface
-- Technical indicators
-
-## Security
-
-FYERS credentials must be stored in Streamlit Secrets and must not be committed to GitHub.
+Keep FYERS credentials in Streamlit Secrets, never in GitHub.
