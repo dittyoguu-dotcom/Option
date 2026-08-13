@@ -19,6 +19,7 @@ from datetime import datetime, timedelta
 
 import pandas as pd
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 import streamlit as st
 
 # ---------------------------------------------------------------------------
@@ -154,6 +155,101 @@ def fetch_spot(fyers):
         return None
 
 
+@st.cache_data(ttl=20, show_spinner=False)
+def fetch_today_candles(_fyers, symbol, resolution):
+    """Today's intraday candles for the exact option contract, straight from
+    Fyers — real OHLCV, from market open to now. (OI history isn't available
+    from any broker API, but price history like this is.) Cached briefly so
+    a 1-min chart isn't re-fetched on every 10s OI poll."""
+    fyers = _fyers
+    today = datetime.now().strftime("%Y-%m-%d")
+    resp = fyers.history(data={
+        "symbol": symbol,
+        "resolution": resolution,
+        "date_format": "1",
+        "range_from": today,
+        "range_to": today,
+        "cont_flag": "0",
+    })
+    if resp.get("s") != "ok":
+        return [], resp
+    return resp.get("candles", []), resp
+
+
+def demo_candles(strike, opt_type, resolution_minutes=5):
+    """Synthetic full-session candles for demo mode, built from the same
+    seeded random walk as demo_ticks, spread across market hours."""
+    ticks = demo_ticks(strike, opt_type, n=150)
+    now = datetime.now()
+    session_start = now.replace(hour=9, minute=15, second=0, microsecond=0)
+    session_end = now.replace(hour=15, minute=30, second=0, microsecond=0)
+    if now < session_start:
+        session_end = session_start + timedelta(hours=6, minutes=15)
+    elif now < session_end:
+        session_end = now
+    span = max(60, (session_end - session_start).total_seconds())
+    step = span / len(ticks)
+    for i, t in enumerate(ticks):
+        t["dt"] = session_start + timedelta(seconds=i * step)
+
+    bins = {}
+    for t in ticks:
+        floored_minute = t["dt"].minute - (t["dt"].minute % resolution_minutes)
+        bin_key = t["dt"].replace(minute=floored_minute, second=0, microsecond=0)
+        bins.setdefault(bin_key, []).append(t)
+    candles = []
+    for k in sorted(bins):
+        vals = bins[k]
+        prices = [v["premium"] for v in vals]
+        vol = sum(v["volume"] for v in vals)
+        candles.append([k.timestamp(), prices[0], max(prices), min(prices), prices[-1], vol])
+    return candles
+
+
+def render_price_chart(candles, support=None, resistance=None):
+    """TradingView-style candlestick + volume panel."""
+    if not candles:
+        st.info("No candle data yet — try again shortly, or check if the market is open.")
+        return
+    times = [datetime.fromtimestamp(c[0]) for c in candles]
+    opens = [c[1] for c in candles]
+    highs = [c[2] for c in candles]
+    lows = [c[3] for c in candles]
+    closes = [c[4] for c in candles]
+    vols = [c[5] for c in candles]
+
+    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.75, 0.25], vertical_spacing=0.03)
+    fig.add_trace(go.Candlestick(
+        x=times, open=opens, high=highs, low=lows, close=closes,
+        increasing_line_color="#26a69a", decreasing_line_color="#ef5350",
+        increasing_fillcolor="#26a69a", decreasing_fillcolor="#ef5350",
+        name="Premium", showlegend=False,
+    ), row=1, col=1)
+
+    if support:
+        fig.add_hline(y=(support["low"] + support["high"]) / 2, line_dash="dot", line_color="#3fb950",
+                       annotation_text="Support", annotation_font_color="#3fb950",
+                       annotation_position="right", row=1, col=1)
+    if resistance:
+        fig.add_hline(y=(resistance["low"] + resistance["high"]) / 2, line_dash="dot", line_color="#f85149",
+                       annotation_text="Resistance", annotation_font_color="#f85149",
+                       annotation_position="right", row=1, col=1)
+
+    vol_colors = ["#26a69a" if c >= o else "#ef5350" for o, c in zip(opens, closes)]
+    fig.add_trace(go.Bar(x=times, y=vols, marker_color=vol_colors, name="Volume", showlegend=False), row=2, col=1)
+
+    fig.update_layout(
+        template="plotly_dark", paper_bgcolor="#131722", plot_bgcolor="#131722",
+        height=460, margin=dict(l=10, r=50, t=10, b=10),
+        xaxis_rangeslider_visible=False, xaxis2_rangeslider_visible=False,
+        dragmode="pan",
+    )
+    fig.update_xaxes(showgrid=True, gridcolor="#1e222d")
+    fig.update_yaxes(showgrid=True, gridcolor="#1e222d", row=1, col=1)
+    fig.update_yaxes(showgrid=False, row=2, col=1)
+    st.plotly_chart(fig, use_container_width=True, config={"scrollZoom": True})
+
+
 # ---------------------------------------------------------------------------
 # Tick classification — identical logic to the mock demo, applied to real
 # polled data. Each poll = one "tick" for the selected strike+type.
@@ -245,6 +341,10 @@ else:
     fyers = None
     expiry_ts = ""
 
+chart_resolution = st.sidebar.select_slider(
+    "Chart interval", options=["1", "5", "15"], value="5",
+    format_func=lambda v: f"{v} min",
+)
 bucket_size = st.sidebar.select_slider("Bucket size (₹)", options=[5, 10, 20], value=10)
 alert_on = st.sidebar.checkbox("Alert when a category exceeds", value=True)
 alert_threshold = st.sidebar.number_input("Alert threshold (OI contracts)", value=50000, step=5000)
@@ -394,6 +494,16 @@ if alert_on:
 # ---------------------------------------------------------------------------
 st.markdown(f"### NIFTY {strike} {opt_type} &nbsp;·&nbsp; {mode}")
 st.caption(f"Spot ref ₹{spot:,.2f}" if spot else "")
+
+# --- Premium chart (TradingView-style candles) ---
+if mode == "Live (Fyers)" and match:
+    candles, candle_resp = fetch_today_candles(fyers, match["symbol"], chart_resolution)
+    if not candles and candle_resp.get("s") != "ok":
+        st.caption(f"Chart data unavailable for this contract: {candle_resp.get('message', candle_resp)}")
+else:
+    candles = demo_candles(strike, opt_type, resolution_minutes=int(chart_resolution))
+
+render_price_chart(candles, support=sup, resistance=resistance)
 
 top1, top2, top3 = st.columns(3)
 top1.metric("PCR (same strike)", f"{pcr:.2f}", pcr_label)
