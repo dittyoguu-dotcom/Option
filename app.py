@@ -30,10 +30,60 @@ st.set_page_config(page_title="NIFTY OI Confluence Dashboard", layout="wide", pa
 DARK_CSS = """
 <style>
 .stApp { background-color: #0b0e11; color: #e7e9ea; }
+.block-container { padding-top: 1.2rem; padding-bottom: 3rem; }
 [data-testid="stMetricValue"] { font-family: monospace; }
+
+/* Stat cards used throughout instead of st.metric, so labels/values never
+   truncate on a narrow phone screen. */
+.stat-row { display: flex; gap: 10px; margin: 6px 0 14px 0; flex-wrap: wrap; }
+.stat-card {
+    flex: 1 1 0; min-width: 104px; background: #12161b; border: 1px solid #20252c;
+    border-radius: 12px; padding: 12px 14px;
+}
+.stat-label {
+    color: #7d8590; font-size: 11px; text-transform: uppercase; letter-spacing: .04em;
+    font-family: monospace; margin-bottom: 4px;
+}
+.stat-value {
+    font-family: monospace; font-size: 22px; font-weight: 700; color: #e7e9ea;
+    line-height: 1.15; word-break: break-word;
+}
+.stat-badge {
+    display: inline-block; margin-top: 6px; font-size: 11px; font-family: monospace;
+    padding: 2px 8px; border-radius: 999px; font-weight: 600;
+}
+
+.section-title {
+    font-family: monospace; font-size: 12px; color: #7d8590; text-transform: uppercase;
+    letter-spacing: .05em; margin: 18px 0 6px 0;
+}
+
+.confluence-box {
+    border-radius: 12px; padding: 14px 16px; margin: 4px 0 16px 0; border: 1px solid;
+}
 </style>
 """
 st.markdown(DARK_CSS, unsafe_allow_html=True)
+
+
+def stat_card(label, value, badge=None, badge_bg="#1c2b20", badge_color="#3fb950"):
+    badge_html = (
+        f"<span class='stat-badge' style='background:{badge_bg};color:{badge_color};'>{badge}</span>"
+        if badge else ""
+    )
+    return (
+        f"<div class='stat-card'><div class='stat-label'>{label}</div>"
+        f"<div class='stat-value'>{value}</div>{badge_html}</div>"
+    )
+
+
+def stat_row(cards_html):
+    st.markdown(f"<div class='stat-row'>{''.join(cards_html)}</div>", unsafe_allow_html=True)
+
+
+# Shared config for every Plotly chart in the app — no modebar clutter
+# (camera/zoom/pan icons colliding with legends), touch pinch-zoom stays on.
+CHART_CONFIG = {"scrollZoom": True, "displayModeBar": False}
 
 CATS = [
     {"key": "long_build", "label": "Long buildup", "sub": "premium ↑ · OI ↑", "color": "#3fb950"},
@@ -259,14 +309,14 @@ def render_price_chart(candles, support=None, resistance=None):
 
     fig.update_layout(
         template="plotly_dark", paper_bgcolor="#131722", plot_bgcolor="#131722",
-        height=460, margin=dict(l=10, r=50, t=10, b=10),
+        height=440, margin=dict(l=10, r=48, t=18, b=10),
         xaxis_rangeslider_visible=False, xaxis2_rangeslider_visible=False,
         dragmode="pan",
     )
     fig.update_xaxes(showgrid=True, gridcolor="#1e222d")
     fig.update_yaxes(showgrid=True, gridcolor="#1e222d", row=1, col=1)
     fig.update_yaxes(showgrid=False, row=2, col=1)
-    st.plotly_chart(fig, use_container_width=True, config={"scrollZoom": True})
+    st.plotly_chart(fig, use_container_width=True, config=CHART_CONFIG)
 
 
 # ---------------------------------------------------------------------------
@@ -422,20 +472,32 @@ def render_backtest(fyers, mode):
     current_time = datetime.fromtimestamp(visible[-1][0]).strftime("%H:%M")
     support, resistance = swing_levels(visible)
 
-    m1, m2, m3 = st.columns(3)
-    m1.metric("Time", current_time)
-    m2.metric("Price", f"₹{visible[-1][4]:.1f}")
+    chg_badge = None
+    chg_positive = True
     if len(visible) > 1:
         chg = visible[-1][4] - visible[0][1]
-        m3.metric("Change from open", f"₹{chg:+.1f}", f"{chg / visible[0][1] * 100:+.2f}%")
+        chg_pct = chg / visible[0][1] * 100
+        chg_badge = f"{chg:+.1f} ({chg_pct:+.2f}%)"
+        chg_positive = chg >= 0
+    stat_row([
+        stat_card("Time", current_time),
+        stat_card("Price", f"₹{visible[-1][4]:.1f}"),
+        stat_card("Change from open", chg_badge or "—",
+                   badge_bg="#1c2b20" if chg_positive else "#2b1c1c",
+                   badge_color="#3fb950" if chg_positive else "#f85149") if chg_badge else
+        stat_card("Change from open", "—"),
+    ])
 
     sup_obj = {"low": support, "high": support} if support else None
     res_obj = {"low": resistance, "high": resistance} if resistance else None
     render_price_chart(visible, support=sup_obj, resistance=res_obj)
 
-    sc1, sc2 = st.columns(2)
-    sc1.markdown(f"**🟢 Swing support:** ₹{support:.1f}" if support else "**🟢 Swing support:** —")
-    sc2.markdown(f"**🔴 Swing resistance:** ₹{resistance:.1f}" if resistance else "**🔴 Swing resistance:** —")
+    stat_row([
+        stat_card("🟢 Swing support", f"₹{support:.1f}" if support else "—",
+                   badge_bg="#1c2b20", badge_color="#3fb950"),
+        stat_card("🔴 Swing resistance", f"₹{resistance:.1f}" if resistance else "—",
+                   badge_bg="#2b1c1c", badge_color="#f85149"),
+    ])
 
     with st.expander("Show candle data"):
         df = pd.DataFrame(visible, columns=["timestamp", "open", "high", "low", "close", "volume"])
@@ -621,9 +683,9 @@ def render_spot_oi_chart(fyers, mode):
 
     fig.update_layout(
         template="plotly_dark", paper_bgcolor="#131722", plot_bgcolor="#131722",
-        height=520, margin=dict(l=10, r=10, t=30, b=10),
+        height=540, margin=dict(l=10, r=10, t=10, b=10),
         xaxis_rangeslider_visible=False, dragmode="pan",
-        legend=dict(orientation="h", y=1.06),
+        legend=dict(orientation="h", y=-0.06, x=0.5, xanchor="center"),
         barmode="overlay",
     )
     fig.update_xaxes(showgrid=True, gridcolor="#1e222d", row=1, col=1)
@@ -631,13 +693,13 @@ def render_spot_oi_chart(fyers, mode):
     fig.update_yaxes(showgrid=True, gridcolor="#1e222d", row=1, col=1)
     fig.update_yaxes(showticklabels=False, row=1, col=2)
 
-    st.markdown("### NIFTY Spot &nbsp;·&nbsp; OI change by strike")
+    st.markdown("### NIFTY Spot · OI change by strike")
     st.caption(
         f"Spot ₹{spot:,.2f} · red = Call OI change · green = Put OI change · "
         "dotted lines mark developing support/resistance"
     )
     event = st.plotly_chart(
-        fig, use_container_width=True, config={"scrollZoom": True},
+        fig, use_container_width=True, config=CHART_CONFIG,
         on_select="rerun", key="spotoi_chart",
     )
 
@@ -649,13 +711,18 @@ def render_spot_oi_chart(fyers, mode):
             sel_strike, sel_type = cd[0], cd[1]
             entry = store.get((sel_strike, sel_type), {})
             net = entry.get("last_oi", 0) - entry.get("baseline_oi", 0)
-            st.markdown(f"**NIFTY {sel_strike} {sel_type} — intraday OI breakdown**")
-            b1, b2 = st.columns(2)
-            b1.metric("Net OI change", f"{net:+,.0f}")
-            b1.metric("Long buildup", f"{entry.get('long_build', 0):,.0f}")
-            b1.metric("Short covering", f"{entry.get('short_cover', 0):,.0f}")
-            b2.metric("Short buildup", f"{entry.get('short_build', 0):,.0f}")
-            b2.metric("Long unwinding", f"{entry.get('long_unwind', 0):,.0f}")
+            st.markdown(f"<div class='section-title'>NIFTY {sel_strike} {sel_type} — intraday OI breakdown</div>", unsafe_allow_html=True)
+            stat_row([
+                stat_card("Net OI change", f"{net:+,.0f}",
+                           badge_bg="#1c2b20" if net >= 0 else "#2b1c1c",
+                           badge_color="#3fb950" if net >= 0 else "#f85149"),
+                stat_card("Long buildup", f"{entry.get('long_build', 0):,.0f}"),
+            ])
+            stat_row([
+                stat_card("Short buildup", f"{entry.get('short_build', 0):,.0f}"),
+                stat_card("Short covering", f"{entry.get('short_cover', 0):,.0f}"),
+                stat_card("Long unwinding", f"{entry.get('long_unwind', 0):,.0f}"),
+            ])
     else:
         st.caption("Tap a bar to see its long-build / short-build / covering / unwind breakdown.")
 
@@ -851,8 +918,8 @@ if alert_on:
 # ---------------------------------------------------------------------------
 # Layout
 # ---------------------------------------------------------------------------
-st.markdown(f"### NIFTY {strike} {opt_type} &nbsp;·&nbsp; {mode}")
-st.caption(f"Spot ref ₹{spot:,.2f}" if spot else "")
+st.markdown(f"### NIFTY {strike} {opt_type}")
+st.caption(f"{mode} · Spot ref ₹{spot:,.2f}" if spot else mode)
 
 # --- Premium chart (TradingView-style candles) ---
 if mode == "Live (Fyers)" and match:
@@ -862,41 +929,52 @@ if mode == "Live (Fyers)" and match:
 else:
     candles = demo_candles(strike, opt_type, resolution_minutes=int(chart_resolution))
 
+if candles and len(candles) < 8:
+    st.caption(f"Session just started — {len(candles)} candle(s) so far, more fill in as time passes.")
+
 render_price_chart(candles, support=sup, resistance=resistance)
 
-top1, top2, top3 = st.columns(3)
-top1.metric("PCR (same strike)", f"{pcr:.2f}", pcr_label)
-top2.metric("Market Control", control_verdict, f"Buy {buy_pct:.0f}% / Sell {sell_pct:.0f}%")
-top3.metric("Current premium", f"₹{current_premium:.1f}")
+# --- Key stats, as cards (no truncation, consistent look) ---
+stat_row([
+    stat_card("PCR (same strike)", f"{pcr:.2f}", pcr_label,
+              badge_bg="#1c2b20" if pcr_label == "Bullish bias" else "#2b1c1c" if pcr_label == "Bearish bias" else "#20242c",
+              badge_color="#3fb950" if pcr_label == "Bullish bias" else "#f85149" if pcr_label == "Bearish bias" else "#9aa0a6"),
+    stat_card("Market control", control_verdict, f"Buy {buy_pct:.0f}% / Sell {sell_pct:.0f}%",
+              badge_bg="#1c2b20" if control_verdict == "Buyers in control" else "#2b1c1c" if control_verdict == "Sellers in control" else "#20242c",
+              badge_color="#3fb950" if control_verdict == "Buyers in control" else "#f85149" if control_verdict == "Sellers in control" else "#9aa0a6"),
+    stat_card("Current premium", f"₹{current_premium:.1f}"),
+])
 
 st.markdown(
-    f"<div style='background:#111417;border:1px solid {confluence_color}55;border-radius:10px;"
-    f"padding:12px 16px;margin:10px 0;'><span style='color:#4b5158;font-family:monospace;"
-    f"font-size:11px;'>CONFLUENCE</span><br><span style='color:{confluence_color};font-weight:700;"
+    f"<div class='confluence-box' style='background:#111417;border-color:{confluence_color}55;'>"
+    f"<span style='color:#7d8590;font-family:monospace;font-size:11px;text-transform:uppercase;"
+    f"letter-spacing:.05em;'>Confluence</span><br><span style='color:{confluence_color};font-weight:700;"
     f"font-family:monospace;font-size:15px;'>{confluence_text}</span></div>",
     unsafe_allow_html=True,
 )
 
-sc1, sc2 = st.columns(2)
-with sc1:
-    st.markdown("**🟢 Support**")
-    if sup:
-        st.write(f"₹{sup['low']}–{sup['high']} · score {sup['score']:,}")
-    else:
-        st.caption("No conviction below current premium yet")
-with sc2:
-    st.markdown("**🔴 Resistance**")
-    if resistance:
-        st.write(f"₹{resistance['low']}–{resistance['high']} · score {resistance['score']:,}")
-    else:
-        st.caption("No conviction above current premium yet")
+stat_row([
+    stat_card("🟢 Support", f"₹{sup['low']}–{sup['high']}" if sup else "—",
+              f"score {sup['score']:,}" if sup else "no conviction yet",
+              badge_bg="#1c2b20", badge_color="#3fb950"),
+    stat_card("🔴 Resistance", f"₹{resistance['low']}–{resistance['high']}" if resistance else "—",
+              f"score {resistance['score']:,}" if resistance else "no conviction yet",
+              badge_bg="#2b1c1c", badge_color="#f85149"),
+])
 
 if alert_on and alerts:
-    st.warning(f"⚠ {len(alerts)} level(s) crossed your threshold")
+    st.markdown("<div class='section-title'>⚠ Alerts</div>", unsafe_allow_html=True)
     for b, c, v in alerts[:3]:
-        st.caption(f"₹{b['low']}–{b['high']} · {c['label']} = {v:,.0f}")
+        st.markdown(
+            f"<div style='background:#1a1408;border:1px solid #4a3a0f;border-radius:8px;"
+            f"padding:8px 12px;margin-bottom:6px;font-family:monospace;font-size:13px;'>"
+            f"₹{b['low']}–{b['high']} · <span style='color:{c['color']};'>{c['label']}</span> "
+            f"= {v:,.0f}</div>",
+            unsafe_allow_html=True,
+        )
 
-# --- Chart ---
+# --- OI buildup chart ---
+st.markdown("<div class='section-title'>OI buildup by premium range</div>", unsafe_allow_html=True)
 fig = go.Figure()
 for c in CATS:
     fig.add_trace(go.Bar(
@@ -907,11 +985,13 @@ for c in CATS:
     ))
 fig.update_layout(
     barmode="stack", template="plotly_dark",
-    paper_bgcolor="#0b0e11", plot_bgcolor="#111417",
-    height=380, legend=dict(orientation="h", y=1.1),
+    paper_bgcolor="#0b0e11", plot_bgcolor="#12161b",
+    height=360, legend=dict(orientation="h", y=-0.18, x=0.5, xanchor="center"),
     margin=dict(l=10, r=10, t=10, b=10),
 )
-st.plotly_chart(fig, use_container_width=True)
+fig.update_xaxes(showgrid=False)
+fig.update_yaxes(showgrid=True, gridcolor="#1e222d")
+st.plotly_chart(fig, use_container_width=True, config=CHART_CONFIG)
 
 # --- Legend / raw table ---
 with st.expander("Show raw bucket data"):
