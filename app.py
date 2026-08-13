@@ -444,6 +444,227 @@ def render_backtest(fyers, mode):
 
 
 # ---------------------------------------------------------------------------
+# Spot + OI-by-strike chart
+# ---------------------------------------------------------------------------
+def update_oi_accumulator(rows):
+    """Runs on every poll against the FULL option chain. Keeps a running
+    baseline (first poll of the session) and cumulative buildup/unwind
+    totals per (strike, type) — same 4-way classification as the rest of
+    the app, just tracked for every strike at once instead of one."""
+    store = st.session_state.setdefault("oi_accum", {})
+    for r in rows:
+        strike = r.get("strike_price", -1)
+        typ = r.get("option_type")
+        if strike <= 0 or typ not in ("CE", "PE"):
+            continue
+        k = (strike, typ)
+        oi = r.get("oi", 0)
+        ltp = r.get("ltp", 0)
+        entry = store.get(k)
+        if entry is None:
+            store[k] = {
+                "baseline_oi": oi, "last_oi": oi, "last_premium": ltp,
+                "long_build": 0, "short_build": 0, "long_unwind": 0, "short_cover": 0,
+            }
+            continue
+        oi_delta = oi - entry["last_oi"]
+        price_up = ltp >= entry["last_premium"]
+        oi_up = oi_delta >= 0
+        mag = abs(oi_delta)
+        if price_up and oi_up:
+            entry["long_build"] += mag
+        elif not price_up and oi_up:
+            entry["short_build"] += mag
+        elif not price_up and not oi_up:
+            entry["long_unwind"] += mag
+        else:
+            entry["short_cover"] += mag
+        entry["last_oi"] = oi
+        entry["last_premium"] = ltp
+    return store
+
+
+def demo_oi_accumulator(strikes, spot):
+    """Deterministic-but-varied fake OI-change data per strike for demo mode."""
+    import random
+    store = {}
+    for s in strikes:
+        for typ in ("CE", "PE"):
+            rand = random.Random(f"{s}-{typ}-oiwall")
+            dist = (s - spot) / 50
+            # Calls build up more above spot, puts build up more below spot —
+            # a plausible-looking wall shape, purely for demo purposes.
+            bias = -dist if typ == "CE" else dist
+            base_change = int(bias * 15000 + rand.randint(-8000, 8000))
+            long_build = max(0, base_change) + rand.randint(0, 4000)
+            short_build = rand.randint(0, 6000)
+            long_unwind = rand.randint(0, 5000)
+            short_cover = max(0, -base_change) + rand.randint(0, 3000)
+            store[(s, typ)] = {
+                "baseline_oi": 400000, "last_oi": 400000 + base_change, "last_premium": 0,
+                "long_build": long_build, "short_build": short_build,
+                "long_unwind": long_unwind, "short_cover": short_cover,
+            }
+    return store
+
+
+def render_spot_oi_chart(fyers, mode):
+    """NIFTY spot candlestick with a linked OI-change-by-strike panel —
+    calls in red, puts in green, sharing the same price axis so OI walls
+    line up visually with the price levels that matter."""
+    st.sidebar.subheader("Spot + OI chart settings")
+    resolution = st.sidebar.select_slider(
+        "Candle interval", options=["1", "5", "15"], value="5",
+        format_func=lambda v: f"{v} min", key="soi_res",
+    )
+    strike_span = st.sidebar.slider("Strikes shown around spot", 6, 20, 12, key="soi_span")
+    refresh_secs = st.sidebar.slider("Refresh every (sec)", 10, 60, 15, key="soi_refresh") if mode == "Live (Fyers)" else None
+
+    if mode == "Live (Fyers)":
+        expiries, raw = fetch_expiries(fyers)
+        if not expiries:
+            st.error(f"Couldn't load expiries from Fyers: {raw}")
+            return
+        expiry_labels = [e["date"] for e in expiries]
+        expiry_choice = st.sidebar.selectbox("Expiry", expiry_labels, key="soi_expiry")
+        expiry_ts = str(expiries[expiry_labels.index(expiry_choice)]["expiry"])
+
+        chain_resp = fetch_chain(fyers, expiry_ts, strikecount=strike_span)
+        if chain_resp.get("s") != "ok":
+            st.error(f"Fyers error: {chain_resp}")
+            return
+        rows = chain_resp["data"]["optionsChain"]
+        spot = fetch_spot(fyers) or 0
+        store = update_oi_accumulator(rows)
+        strikes = sorted({r["strike_price"] for r in rows if r.get("strike_price", -1) > 0})
+        candles, cresp = fetch_today_candles(fyers, UNDERLYING, resolution)
+        if not candles:
+            st.caption(f"Spot chart unavailable right now: {cresp.get('message', cresp)}")
+    else:
+        spot = 24525
+        strikes = sorted({spot + i * 50 for i in range(-strike_span // 2, strike_span // 2 + 1)})
+        store = demo_oi_accumulator(strikes, spot)
+        candles = demo_candles(24550, "CE", resolution_minutes=int(resolution))
+
+    if not strikes:
+        st.info("No strikes to show yet.")
+        return
+
+    strike_gap = 50
+    if len(strikes) > 1:
+        diffs = sorted(strikes[i + 1] - strikes[i] for i in range(len(strikes) - 1))
+        strike_gap = diffs[len(diffs) // 2]
+
+    ce_changes = [store.get((s, "CE"), {}).get("last_oi", 0) - store.get((s, "CE"), {}).get("baseline_oi", 0) for s in strikes]
+    pe_changes = [store.get((s, "PE"), {}).get("last_oi", 0) - store.get((s, "PE"), {}).get("baseline_oi", 0) for s in strikes]
+
+    # --- Support / resistance from OI walls, with a strength label ---
+    all_mags = [abs(v) for v in ce_changes + pe_changes] or [1]
+    max_mag = max(all_mags)
+
+    def strength_label(v):
+        r = abs(v) / max_mag if max_mag else 0
+        return "Strong" if r >= 0.66 else "Moderate" if r >= 0.33 else "Weak"
+
+    resistance_strike = resistance_val = None
+    support_strike = support_val = None
+    for s, c in zip(strikes, ce_changes):
+        if s >= spot and c > 0 and (resistance_val is None or c > resistance_val):
+            resistance_strike, resistance_val = s, c
+    for s, p in zip(strikes, pe_changes):
+        if s <= spot and p > 0 and (support_val is None or p > support_val):
+            support_strike, support_val = s, p
+
+    # --- Build the chart: candlestick + linked OI-wall panel ---
+    fig = make_subplots(
+        rows=1, cols=2, shared_yaxes=True, column_widths=[0.66, 0.34],
+        horizontal_spacing=0.02, subplot_titles=("", "OI change by strike"),
+    )
+
+    if candles:
+        times = [datetime.fromtimestamp(c[0]) for c in candles]
+        fig.add_trace(go.Candlestick(
+            x=times, open=[c[1] for c in candles], high=[c[2] for c in candles],
+            low=[c[3] for c in candles], close=[c[4] for c in candles],
+            increasing_line_color="#26a69a", decreasing_line_color="#ef5350",
+            increasing_fillcolor="#26a69a", decreasing_fillcolor="#ef5350",
+            name="NIFTY", showlegend=False,
+        ), row=1, col=1)
+
+    bar_width = strike_gap * 0.42
+    fig.add_trace(go.Bar(
+        x=ce_changes, y=[s + bar_width * 0.55 for s in strikes], orientation="h",
+        marker_color="#ef5350", name="CE (Call) OI Δ", width=bar_width,
+        customdata=[[s, "CE"] for s in strikes],
+        hovertemplate="Strike %{customdata[0]}<br>CE OI change: %{x:,.0f}<extra></extra>",
+    ), row=1, col=2)
+    fig.add_trace(go.Bar(
+        x=pe_changes, y=[s - bar_width * 0.55 for s in strikes], orientation="h",
+        marker_color="#26a69a", name="PE (Put) OI Δ", width=bar_width,
+        customdata=[[s, "PE"] for s in strikes],
+        hovertemplate="Strike %{customdata[0]}<br>PE OI change: %{x:,.0f}<extra></extra>",
+    ), row=1, col=2)
+
+    if spot:
+        fig.add_hline(y=spot, line_dash="dash", line_color="#9aa0a6", row=1, col=1)
+        fig.add_hline(y=spot, line_dash="dash", line_color="#9aa0a6", row=1, col=2)
+    if resistance_strike:
+        lbl = f"Resistance {resistance_strike} ({strength_label(resistance_val)})"
+        fig.add_hline(y=resistance_strike, line_dash="dot", line_color="#f85149",
+                       annotation_text=lbl, annotation_font_color="#f85149", row=1, col=1)
+        fig.add_hline(y=resistance_strike, line_dash="dot", line_color="#f85149", row=1, col=2)
+    if support_strike:
+        lbl = f"Support {support_strike} ({strength_label(support_val)})"
+        fig.add_hline(y=support_strike, line_dash="dot", line_color="#3fb950",
+                       annotation_text=lbl, annotation_font_color="#3fb950", row=1, col=1)
+        fig.add_hline(y=support_strike, line_dash="dot", line_color="#3fb950", row=1, col=2)
+
+    fig.update_layout(
+        template="plotly_dark", paper_bgcolor="#131722", plot_bgcolor="#131722",
+        height=520, margin=dict(l=10, r=10, t=30, b=10),
+        xaxis_rangeslider_visible=False, dragmode="pan",
+        legend=dict(orientation="h", y=1.06),
+        barmode="overlay",
+    )
+    fig.update_xaxes(showgrid=True, gridcolor="#1e222d", row=1, col=1)
+    fig.update_xaxes(showgrid=True, gridcolor="#1e222d", zeroline=True, zerolinecolor="#3a3f4b", row=1, col=2)
+    fig.update_yaxes(showgrid=True, gridcolor="#1e222d", row=1, col=1)
+    fig.update_yaxes(showticklabels=False, row=1, col=2)
+
+    st.markdown("### NIFTY Spot &nbsp;·&nbsp; OI change by strike")
+    st.caption(
+        f"Spot ₹{spot:,.2f} · red = Call OI change · green = Put OI change · "
+        "dotted lines mark developing support/resistance"
+    )
+    event = st.plotly_chart(
+        fig, use_container_width=True, config={"scrollZoom": True},
+        on_select="rerun", key="spotoi_chart",
+    )
+
+    # --- Click a bar to see the buildup/unwind breakdown for that strike ---
+    points = (event or {}).get("selection", {}).get("points", [])
+    if points:
+        cd = points[0].get("customdata")
+        if cd:
+            sel_strike, sel_type = cd[0], cd[1]
+            entry = store.get((sel_strike, sel_type), {})
+            net = entry.get("last_oi", 0) - entry.get("baseline_oi", 0)
+            st.markdown(f"**NIFTY {sel_strike} {sel_type} — intraday OI breakdown**")
+            b1, b2 = st.columns(2)
+            b1.metric("Net OI change", f"{net:+,.0f}")
+            b1.metric("Long buildup", f"{entry.get('long_build', 0):,.0f}")
+            b1.metric("Short covering", f"{entry.get('short_cover', 0):,.0f}")
+            b2.metric("Short buildup", f"{entry.get('short_build', 0):,.0f}")
+            b2.metric("Long unwinding", f"{entry.get('long_unwind', 0):,.0f}")
+    else:
+        st.caption("Tap a bar to see its long-build / short-build / covering / unwind breakdown.")
+
+    if mode == "Live (Fyers)" and refresh_secs:
+        time.sleep(refresh_secs)
+        st.rerun()
+
+
+# ---------------------------------------------------------------------------
 # Sidebar — mode + controls
 # ---------------------------------------------------------------------------
 st.sidebar.title("⚙️ Controls")
@@ -457,11 +678,15 @@ if mode == "Live (Fyers)":
 else:
     fyers = None
 
-page = st.sidebar.radio("View", ["Live dashboard", "Historical backtest"])
+page = st.sidebar.radio("View", ["Live dashboard", "Historical backtest", "Spot + OI Chart"])
 st.sidebar.divider()
 
 if page == "Historical backtest":
     render_backtest(fyers, mode)
+    st.stop()
+
+if page == "Spot + OI Chart":
+    render_spot_oi_chart(fyers, mode)
     st.stop()
 
 if mode == "Live (Fyers)":
