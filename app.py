@@ -156,24 +156,43 @@ def fetch_spot(fyers):
 
 
 @st.cache_data(ttl=20, show_spinner=False)
-def fetch_today_candles(_fyers, symbol, resolution):
-    """Today's intraday candles for the exact option contract, straight from
-    Fyers — real OHLCV, from market open to now. (OI history isn't available
-    from any broker API, but price history like this is.) Cached briefly so
-    a 1-min chart isn't re-fetched on every 10s OI poll."""
+def fetch_candles_range(_fyers, symbol, resolution, date_from, date_to):
+    """Candles for any date range on any tradable Fyers symbol — used for
+    both the live today-chart and the historical backtest view. (OI history
+    isn't available from any broker API, but price history like this is.)"""
     fyers = _fyers
-    today = datetime.now().strftime("%Y-%m-%d")
     resp = fyers.history(data={
         "symbol": symbol,
         "resolution": resolution,
         "date_format": "1",
-        "range_from": today,
-        "range_to": today,
+        "range_from": date_from,
+        "range_to": date_to,
         "cont_flag": "0",
     })
     if resp.get("s") != "ok":
         return [], resp
     return resp.get("candles", []), resp
+
+
+def fetch_today_candles(fyers, symbol, resolution):
+    today = datetime.now().strftime("%Y-%m-%d")
+    return fetch_candles_range(fyers, symbol, resolution, today, today)
+
+
+def swing_levels(candles, lookback=4):
+    """Simple swing-high/low pivot detector, used as support/resistance for
+    the backtest view since there's no OI to lean on for a past date."""
+    highs, lows = [], []
+    for i in range(lookback, len(candles) - lookback):
+        window = candles[i - lookback:i + lookback + 1]
+        h, l = candles[i][2], candles[i][3]
+        if h == max(c[2] for c in window):
+            highs.append(h)
+        if l == min(c[3] for c in window):
+            lows.append(l)
+    resistance = max(highs) if highs else None
+    support = min(lows) if lows else None
+    return support, resistance
 
 
 def demo_candles(strike, opt_type, resolution_minutes=5):
@@ -319,6 +338,111 @@ def demo_ticks(strike, opt_type, n=150):
     return ticks
 
 
+def demo_day_candles(symbol_label, day, resolution_minutes=5):
+    """Synthetic full-session candles for a chosen past date in demo mode —
+    seeded by the date itself, so the same date always replays identically."""
+    import math
+    import random
+    rand = random.Random(f"{symbol_label}-{day.isoformat()}")
+    session_start = datetime.combine(day, datetime.min.time()).replace(hour=9, minute=15)
+    session_end = datetime.combine(day, datetime.min.time()).replace(hour=15, minute=30)
+    n = 150
+    base = 24500 + rand.randint(-300, 300)
+    price = base
+    candles = []
+    step = (session_end - session_start).total_seconds() / n
+    for i in range(n):
+        drift = math.sin(i / 11 + rand.random() * 3) * 12 + (rand.random() - 0.5) * 18
+        o = price
+        price = max(1, price + drift)
+        h = max(o, price) + rand.random() * 6
+        l = min(o, price) - rand.random() * 6
+        vol = int(2000 + abs(price - o) * 400 + rand.random() * 4000)
+        ts = (session_start + timedelta(seconds=i * step)).timestamp()
+        candles.append([ts, o, h, l, price, vol])
+    return candles
+
+
+def render_backtest(fyers, mode):
+    """Historical price backtest — scrub through any past session candle by
+    candle. There's no historical OI to backtest against (no broker API
+    exposes it), so this view works on price action only: real candles,
+    swing-based support/resistance, and a time slider."""
+    st.sidebar.subheader("Backtest settings")
+    default_day = datetime.now().date() - timedelta(days=1)
+    bt_date = st.sidebar.date_input("Date", value=default_day, max_value=datetime.now().date())
+    bt_resolution = st.sidebar.select_slider(
+        "Candle interval", options=["1", "5", "15", "60"], value="5",
+        format_func=lambda v: f"{v} min",
+    )
+    instrument = st.sidebar.radio("Instrument", ["NIFTY Index", "Custom option symbol"])
+    if instrument == "Custom option symbol":
+        symbol = st.sidebar.text_input(
+            "Fyers symbol", placeholder="e.g. NSE:NIFTY25AUG24500CE",
+            help="Exact contract symbol as Fyers names it. Only works if that "
+                 "contract existed and traded on the date you picked.",
+        )
+        if not symbol:
+            st.info("Enter a Fyers option symbol in the sidebar to backtest it, "
+                     "or switch to NIFTY Index.")
+            return
+        label = symbol
+    else:
+        symbol = UNDERLYING
+        label = "NIFTY 50 Index"
+
+    day_str = bt_date.strftime("%Y-%m-%d")
+
+    if mode == "Live (Fyers)":
+        candles, resp = fetch_candles_range(fyers, symbol, bt_resolution, day_str, day_str)
+        if not candles:
+            st.warning(
+                f"No candle data for {label} on {day_str}: "
+                f"{resp.get('message', resp)}. Try a different date, or check "
+                "the market was open that day."
+            )
+            return
+    else:
+        candles = demo_day_candles(label, bt_date, resolution_minutes=int(bt_resolution))
+
+    st.markdown(f"### 🔁 Backtest — {label} · {day_str}")
+    st.caption(
+        "Price-only replay. There's no historical OI available from Fyers "
+        "or any broker API, so buildup categories can't be reconstructed "
+        "for past sessions — only from days you record going forward."
+    )
+
+    # Scrub slider — like the original demo's time toggle
+    n = len(candles)
+    idx = st.slider(
+        "Scrub through the session", 0, n - 1, n - 1,
+        format=f"candle %d of {n}",
+    )
+    visible = candles[: idx + 1]
+    current_time = datetime.fromtimestamp(visible[-1][0]).strftime("%H:%M")
+    support, resistance = swing_levels(visible)
+
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Time", current_time)
+    m2.metric("Price", f"₹{visible[-1][4]:.1f}")
+    if len(visible) > 1:
+        chg = visible[-1][4] - visible[0][1]
+        m3.metric("Change from open", f"₹{chg:+.1f}", f"{chg / visible[0][1] * 100:+.2f}%")
+
+    sup_obj = {"low": support, "high": support} if support else None
+    res_obj = {"low": resistance, "high": resistance} if resistance else None
+    render_price_chart(visible, support=sup_obj, resistance=res_obj)
+
+    sc1, sc2 = st.columns(2)
+    sc1.markdown(f"**🟢 Swing support:** ₹{support:.1f}" if support else "**🟢 Swing support:** —")
+    sc2.markdown(f"**🔴 Swing resistance:** ₹{resistance:.1f}" if resistance else "**🔴 Swing resistance:** —")
+
+    with st.expander("Show candle data"):
+        df = pd.DataFrame(visible, columns=["timestamp", "open", "high", "low", "close", "volume"])
+        df["time"] = pd.to_datetime(df["timestamp"], unit="s").dt.strftime("%H:%M")
+        st.dataframe(df[["time", "open", "high", "low", "close", "volume"]], use_container_width=True)
+
+
 # ---------------------------------------------------------------------------
 # Sidebar — mode + controls
 # ---------------------------------------------------------------------------
@@ -330,6 +454,17 @@ if mode == "Live (Fyers)":
     if not logged_in:
         st.stop()
     fyers = get_fyers_client()
+else:
+    fyers = None
+
+page = st.sidebar.radio("View", ["Live dashboard", "Historical backtest"])
+st.sidebar.divider()
+
+if page == "Historical backtest":
+    render_backtest(fyers, mode)
+    st.stop()
+
+if mode == "Live (Fyers)":
     expiries, raw = fetch_expiries(fyers)
     if not expiries:
         st.error(f"Couldn't load expiries from Fyers: {raw}")
@@ -338,7 +473,6 @@ if mode == "Live (Fyers)":
     expiry_choice = st.sidebar.selectbox("Expiry", expiry_labels)
     expiry_ts = str(expiries[expiry_labels.index(expiry_choice)]["expiry"])
 else:
-    fyers = None
     expiry_ts = ""
 
 chart_resolution = st.sidebar.select_slider(
